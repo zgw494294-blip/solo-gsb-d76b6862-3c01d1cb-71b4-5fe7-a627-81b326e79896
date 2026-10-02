@@ -20,8 +20,16 @@ const state = {
 
 let solveTimer = null;
 let lastErrorKey = "";
-let inflightToken = 0;
 let lastSolveResult = null; // 最近一次成功的求解结果（供过渡面板重置/默认上限）
+
+// 原求解请求的竞态控制：与过渡规划同一套「单调序号 + 输入指纹」机制。
+// 响应头返回与响应体读完两个时点都要过守卫，堵住「读取 JSON 响应体期间
+// 输入变化 / 较新请求发出，旧响应仍覆盖结果与错误」的窗口。
+const solveState = {
+  inflightId: 0,   // 当前仍可落地的在途求解请求序号；0 表示无（已完成 / 被取代 / 因输入变化作废）
+  inflightSig: "", // 在途求解请求发出时的输入指纹
+  reqSeq: 0,       // 单调递增的请求序号源，永不归零，避免序号被后续请求复用
+};
 
 const $ = (sel) => document.querySelector(sel);
 const elLayers = $("#layers");
@@ -54,6 +62,7 @@ function escapeHtml(s) {
 function scheduleSolve(delay = 200) {
   clearTimeout(solveTimer);
   solveTimer = setTimeout(runSolve, delay);
+  markSolveStaleness();
   markInferStaleness();
   markSuggestStaleness();
   markReviewStaleness();
@@ -427,6 +436,41 @@ function buildSolvePayload() {
   };
 }
 
+function solveSignature(payload) {
+  // 原求解（及其伴随的成环方案）只取决于当前图层、样本与关系
+  return JSON.stringify({
+    layers: payload.layers,
+    samples: payload.samples,
+    relations: payload.relations,
+  });
+}
+
+// 输入指纹变化时：在途求解请求（及其响应）立即失效，不能再改动结果 / 错误 /
+// 加载状态。这里仅结束加载态并作废在途请求；旧响应返回后会在响应守卫处丢弃。
+// reqSeq 不清零，请求序号始终单调递增，旧序号不会被后续请求复用。
+function markSolveStaleness() {
+  if (solveState.inflightId !== 0 &&
+      solveSignature(buildSolvePayload()) !== solveState.inflightSig) {
+    solveState.inflightId = 0;
+    solveState.inflightSig = "";
+    elStatus.textContent = "";
+    elStatus.className = "status";
+  }
+}
+
+// 响应守卫：只有「当前在途请求」且「发出后参与输入未再变化」的响应可以落地。
+// 响应头返回、JSON 响应体读完两个时点都要校验，因此读取响应体期间输入变化或
+// 较新请求发出，旧响应也无法覆盖结果 / 错误 / 加载状态。请求序号取自永不归零
+// 的单调计数器：较早请求即便后返回也无法冒充新请求，成功、HTTP 错误、连接
+// 异常或响应体解析失败四种结局都只会被直接忽略。
+function solveResponseCurrent(reqId, reqSig) {
+  return (
+    solveState.inflightId === reqId &&
+    solveState.inflightSig === reqSig &&
+    solveSignature(buildSolvePayload()) === reqSig
+  );
+}
+
 async function runSolve() {
   // 成环确认请求在途时跳过自动求解：确认成功后会用删除关系后的输入触发求解；
   // 确认被作废 / 失败后，用户的下一次输入会重新走「求解 → 方案」流程，避免
@@ -434,7 +478,13 @@ async function runSolve() {
   if (cycleState.confirmReqId !== 0) return;
   const payload = buildSolvePayload();
 
-  const token = ++inflightToken;
+  // 从永不归零的单调计数器取得本次请求序号，并登记为当前在途请求；
+  // 连续求解或输入变化时，旧请求即便后返回也不会覆盖较新结果（见 solveResponseCurrent）。
+  const reqId = ++solveState.reqSeq;
+  solveState.inflightId = reqId;
+  const reqSig = solveSignature(payload);
+  solveState.inflightSig = reqSig;
+
   elStatus.textContent = "计算中…";
   elStatus.className = "status busy";
 
@@ -444,8 +494,26 @@ async function runSolve() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (token !== inflightToken) return; // 已有更新的请求，丢弃旧结果
-    const data = await resp.json();
+    if (!solveResponseCurrent(reqId, reqSig)) return; // 响应头返回前已被取代 / 作废
+    let data;
+    try {
+      data = await resp.json();
+    } catch (parseErr) {
+      // 响应体解析失败同样受守卫约束：过期请求的解析失败不得改动任何状态
+      if (!solveResponseCurrent(reqId, reqSig)) return;
+      solveState.inflightId = 0;
+      solveState.inflightSig = "";
+      elStatus.textContent = "";
+      elStatus.className = "status";
+      showErrors([{ scope: "form", message: "计算服务返回了无法解析的响应：" + parseErr.message }]);
+      return;
+    }
+    // 读完 JSON 响应体后再守卫一次：读取期间输入可能已变化、或已发出较新请求
+    if (!solveResponseCurrent(reqId, reqSig)) return;
+    solveState.inflightId = 0;
+    solveState.inflightSig = "";
+    elStatus.textContent = "";
+    elStatus.className = "status";
     if (!resp.ok) {
       const errors = data.errors || [{ scope: "form", message: "求解失败" }];
       showErrors(errors);
@@ -459,7 +527,11 @@ async function runSolve() {
       renderResult(data);
     }
   } catch (err) {
-    if (token !== inflightToken) return;
+    if (!solveResponseCurrent(reqId, reqSig)) return;
+    solveState.inflightId = 0;
+    solveState.inflightSig = "";
+    elStatus.textContent = "";
+    elStatus.className = "status";
     showErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
   }
 }
@@ -945,6 +1017,8 @@ function applyInferResult() {
   renderInferResult(inferState.result);
   render();
   markTransitionStaleness();
+  // 图层不透明度已被写回：在途的方案 / 确认请求立即作废，旧响应不得再落地
+  markCycleStaleness();
   runSolve();
 }
 
@@ -1678,6 +1752,8 @@ function appendReviewSample() {
   renderSuggestControls();
   markReviewStaleness();
   markTransitionStaleness();
+  // 已追加样本：在途的方案 / 确认请求立即作废，旧响应不得再落地
+  markCycleStaleness();
   runSolve();
 }
 
@@ -1771,11 +1847,14 @@ function cyclePlanFresh() {
 }
 
 // 响应守卫：只有「当前在途的该类请求」且「发出后输入始终未变」的响应可以
-// 更新方案 / 错误 / 加载状态；旧请求无论成功、HTTP 错误还是连接异常都丢弃。
+// 更新方案 / 错误 / 加载状态；旧请求无论成功、HTTP 错误、连接异常还是响应体
+// 解析失败都丢弃。响应头返回、JSON 响应体读完两个时点都要过守卫。
 function cycleResponseCurrent(kind, reqId, reqSig) {
   const id = kind === "confirm" ? cycleState.confirmReqId : cycleState.planReqId;
+  const sig = kind === "confirm" ? cycleState.confirmReqSig : cycleState.planReqSig;
   return (
     id === reqId &&
+    sig === reqSig &&
     cycleSignature(buildSolvePayload()) === reqSig
   );
 }
@@ -1802,7 +1881,22 @@ async function runCyclePlan(payload, opts = {}) {
       body: JSON.stringify(payload),
     });
     if (!cycleResponseCurrent("plan", reqId, reqSig)) return;
-    const data = await resp.json();
+    let data;
+    try {
+      data = await resp.json();
+    } catch (parseErr) {
+      // 响应体解析失败同样受守卫约束：过期请求的解析失败不得改动方案 / 错误 / 加载状态
+      if (!cycleResponseCurrent("plan", reqId, reqSig)) return;
+      cycleState.planReqId = 0;
+      cycleState.planReqSig = "";
+      elCycleStatus.textContent = "";
+      elCycleStatus.className = "status";
+      showCycleErrors([{ scope: "form", message: "计算服务返回了无法解析的响应：" + parseErr.message }]);
+      return;
+    }
+    // 读完 JSON 响应体后再守卫一次：读取期间输入可能已变化、或已发出较新请求，
+    // 此时不能清空在途登记 / 加载状态，以免旧响应覆盖较新请求
+    if (!cycleResponseCurrent("plan", reqId, reqSig)) return;
     cycleState.planReqId = 0;
     cycleState.planReqSig = "";
     elCycleStatus.textContent = "";
@@ -1909,7 +2003,22 @@ async function confirmCyclePlan() {
       body: JSON.stringify(body),
     });
     if (!cycleResponseCurrent("confirm", reqId, reqSig)) return;
-    const data = await resp.json();
+    let data;
+    try {
+      data = await resp.json();
+    } catch (parseErr) {
+      // 响应体解析失败同样受守卫约束：过期确认的解析失败不得删除关系或改动结果 / 错误 / 加载状态
+      if (!cycleResponseCurrent("confirm", reqId, reqSig)) return;
+      cycleState.confirmReqId = 0;
+      cycleState.confirmReqSig = "";
+      elCycleStatus.textContent = "";
+      elCycleStatus.className = "status";
+      showCycleErrors([{ scope: "form", message: "计算服务返回了无法解析的响应：" + parseErr.message }]);
+      return;
+    }
+    // 读完 JSON 响应体后再守卫一次：读取期间输入可能已变化，旧确认即便成功
+    // 也不得删除关系或覆盖较新请求的结果 / 加载状态
+    if (!cycleResponseCurrent("confirm", reqId, reqSig)) return;
     cycleState.confirmReqId = 0;
     cycleState.confirmReqSig = "";
     elCycleStatus.textContent = "";
