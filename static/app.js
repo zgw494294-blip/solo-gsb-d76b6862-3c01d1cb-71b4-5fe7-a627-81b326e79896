@@ -23,6 +23,16 @@ let lastErrorKey = "";
 let inflightToken = 0;
 let lastSolveResult = null; // 最近一次成功的求解结果（供过渡面板重置/默认上限）
 
+// 原求解与成环解除流程共用的输入纪元：图层、样本或关系每变化一次就 +1（只增不减）。
+// 三类请求（原求解 / 解除方案 / 确认解除）发出时记录当前纪元；响应落地前纪元若已变，
+// 说明请求在途期间（含响应体读取期间）输入发生过变化——该请求立即作废，
+// 即使之后改回原值也不会恢复（纪元不会回到旧值）。
+let solveInputEpoch = 0;
+
+function noteSolveInputChanged() {
+  solveInputEpoch += 1;
+}
+
 const $ = (sel) => document.querySelector(sel);
 const elLayers = $("#layers");
 const elSamples = $("#samples");
@@ -52,6 +62,7 @@ function escapeHtml(s) {
 }
 
 function scheduleSolve(delay = 200) {
+  noteSolveInputChanged();
   clearTimeout(solveTimer);
   solveTimer = setTimeout(runSolve, delay);
   markInferStaleness();
@@ -427,6 +438,12 @@ function buildSolvePayload() {
   };
 }
 
+// 响应守卫：只有「仍是最新一次求解」且「发出后图层 / 样本 / 关系未再变化」的响应
+// 可以落地；响应体读完之后必须再次判定——读取期间发生的输入变化或较新请求同样作数。
+function solveResponseCurrent(token, epoch) {
+  return token === inflightToken && epoch === solveInputEpoch;
+}
+
 async function runSolve() {
   // 成环确认请求在途时跳过自动求解：确认成功后会用删除关系后的输入触发求解；
   // 确认被作废 / 失败后，用户的下一次输入会重新走「求解 → 方案」流程，避免
@@ -435,6 +452,7 @@ async function runSolve() {
   const payload = buildSolvePayload();
 
   const token = ++inflightToken;
+  const epoch = solveInputEpoch;
   elStatus.textContent = "计算中…";
   elStatus.className = "status busy";
 
@@ -444,8 +462,11 @@ async function runSolve() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (token !== inflightToken) return; // 已有更新的请求，丢弃旧结果
+    if (!solveResponseCurrent(token, epoch)) return; // 已有更新的请求或输入已变，丢弃旧响应
     const data = await resp.json();
+    // 响应体读取期间输入可能又变、或较新请求已发出：落地前必须再过一次守卫，
+    // 过期响应无论成功、HTTP 错误还是解析失败都不得改动结果、错误与加载状态
+    if (!solveResponseCurrent(token, epoch)) return;
     if (!resp.ok) {
       const errors = data.errors || [{ scope: "form", message: "求解失败" }];
       showErrors(errors);
@@ -459,7 +480,7 @@ async function runSolve() {
       renderResult(data);
     }
   } catch (err) {
-    if (token !== inflightToken) return;
+    if (!solveResponseCurrent(token, epoch)) return;
     showErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
   }
 }
@@ -944,6 +965,8 @@ function applyInferResult() {
   inferState.appliedSig = inferSignature();
   renderInferResult(inferState.result);
   render();
+  noteSolveInputChanged();
+  markCycleStaleness();
   markTransitionStaleness();
   runSolve();
 }
@@ -1674,6 +1697,8 @@ function appendReviewSample() {
   // 追加即输入变化，复核与建议结果一并失效，不能再用于下一次追加。
   state.samples.push({ background: r.selectedBackground, target: r.measuredColor });
   render();
+  noteSolveInputChanged();
+  markCycleStaleness();
   markSuggestStaleness();
   renderSuggestControls();
   markReviewStaleness();
@@ -1688,9 +1713,9 @@ const cycleState = {
   planKey: "",         // 方案产生时的输入指纹（图层 / 样本 / 关系）
   invalidated: false,  // 方案展示后输入是否曾变化过：一旦置位，改回原值也不复活
   planReqId: 0,        // 当前仍可落地的在途「方案」请求序号；0 表示无
-  planReqSig: "",      // 在途方案请求发出时的输入指纹
+  planReqEpoch: 0,     // 在途方案请求发出时的输入纪元
   confirmReqId: 0,     // 当前仍可落地的在途「确认」请求序号；0 表示无
-  confirmReqSig: "",   // 在途确认请求发出时的输入指纹
+  confirmReqEpoch: 0,  // 在途确认请求发出时的输入纪元
   reqSeq: 0,           // 单调递增的请求序号源（方案/确认共用），永不归零
 };
 
@@ -1718,9 +1743,9 @@ function clearCyclePlan() {
   cycleState.planKey = "";
   cycleState.invalidated = false;
   cycleState.planReqId = 0;
-  cycleState.planReqSig = "";
+  cycleState.planReqEpoch = 0;
   cycleState.confirmReqId = 0;
-  cycleState.confirmReqSig = "";
+  cycleState.confirmReqEpoch = 0;
   elCycleCard.hidden = true;
   elCycleResult.innerHTML = "";
   elCycleErrors.hidden = true;
@@ -1728,18 +1753,20 @@ function clearCyclePlan() {
   elCycleStatus.className = "status";
 }
 
-// 输入（图层 / 样本 / 关系）变化时：在途的方案 / 确认请求若指纹与当前不一致则
-// 立即作废（加载态随之结束，旧响应在守卫处丢弃）；已展示方案一旦在获取后
-// 发生过任何变化即永久作废——改回原值也不能恢复确认资格。reqSeq 永不归零。
+// 输入（图层 / 样本 / 关系）变化时：在途的方案 / 确认请求若发出纪元与当前不一致则
+// 立即作废（加载态随之结束，旧响应——无论成功、HTTP 错误、连接异常还是解析失败——
+// 都在响应守卫处被丢弃）；纪元只增不减，改回原值也不能让旧请求复活。
+// 已展示方案一旦在获取后发生过任何变化即永久作废——改回原值也不能恢复确认资格。
+// reqSeq 永不归零。
 function markCycleStaleness() {
   const sig = cycleSignature(buildSolvePayload());
-  if (cycleState.planReqId !== 0 && sig !== cycleState.planReqSig) {
+  if (cycleState.planReqId !== 0 && solveInputEpoch !== cycleState.planReqEpoch) {
     cycleState.planReqId = 0;
-    cycleState.planReqSig = "";
+    cycleState.planReqEpoch = 0;
   }
-  if (cycleState.confirmReqId !== 0 && sig !== cycleState.confirmReqSig) {
+  if (cycleState.confirmReqId !== 0 && solveInputEpoch !== cycleState.confirmReqEpoch) {
     cycleState.confirmReqId = 0;
-    cycleState.confirmReqSig = "";
+    cycleState.confirmReqEpoch = 0;
   }
   if (!cycleBusy()) {
     elCycleStatus.textContent = "";
@@ -1770,14 +1797,12 @@ function cyclePlanFresh() {
     cycleSignature(buildSolvePayload()) === cycleState.planKey;
 }
 
-// 响应守卫：只有「当前在途的该类请求」且「发出后输入始终未变」的响应可以
-// 更新方案 / 错误 / 加载状态；旧请求无论成功、HTTP 错误还是连接异常都丢弃。
-function cycleResponseCurrent(kind, reqId, reqSig) {
+// 响应守卫：只有「当前在途的该类请求」且「发出后输入纪元未变」的响应可以
+// 更新方案 / 关系 / 结果 / 错误 / 加载状态；旧请求无论成功、HTTP 错误、
+// 连接异常还是解析失败都丢弃。判定在响应体读完之后进行，读取期间发生的变化同样作数。
+function cycleResponseCurrent(kind, reqId, reqEpoch) {
   const id = kind === "confirm" ? cycleState.confirmReqId : cycleState.planReqId;
-  return (
-    id === reqId &&
-    cycleSignature(buildSolvePayload()) === reqSig
-  );
+  return id === reqId && reqEpoch === solveInputEpoch;
 }
 
 async function runCyclePlan(payload, opts = {}) {
@@ -1786,8 +1811,9 @@ async function runCyclePlan(payload, opts = {}) {
   const silentOnError = !!opts.silentOnError;
   const reqId = ++cycleState.reqSeq;
   cycleState.planReqId = reqId;
-  const reqSig = cycleSignature(payload);
-  cycleState.planReqSig = reqSig;
+  const reqSig = cycleSignature(payload); // 仅用于记录方案对应的输入指纹（planKey）
+  const reqEpoch = solveInputEpoch;
+  cycleState.planReqEpoch = reqEpoch;
 
   elCycleCard.hidden = false;
   elCycleErrors.hidden = true;
@@ -1801,10 +1827,12 @@ async function runCyclePlan(payload, opts = {}) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (!cycleResponseCurrent("plan", reqId, reqSig)) return;
+    if (!cycleResponseCurrent("plan", reqId, reqEpoch)) return;
     const data = await resp.json();
+    // 响应体读取期间输入可能又变、或较新请求已发出：落地前必须再过一次守卫
+    if (!cycleResponseCurrent("plan", reqId, reqEpoch)) return;
     cycleState.planReqId = 0;
-    cycleState.planReqSig = "";
+    cycleState.planReqEpoch = 0;
     elCycleStatus.textContent = "";
     elCycleStatus.className = "status";
     if (!resp.ok) {
@@ -1831,9 +1859,9 @@ async function runCyclePlan(payload, opts = {}) {
     cycleState.invalidated = false;
     renderCyclePlan(data, true);
   } catch (err) {
-    if (!cycleResponseCurrent("plan", reqId, reqSig)) return;
+    if (!cycleResponseCurrent("plan", reqId, reqEpoch)) return;
     cycleState.planReqId = 0;
-    cycleState.planReqSig = "";
+    cycleState.planReqEpoch = 0;
     elCycleStatus.textContent = "";
     elCycleStatus.className = "status";
     showCycleErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
@@ -1887,8 +1915,10 @@ async function confirmCyclePlan() {
   const payload = buildSolvePayload();
   const reqId = ++cycleState.reqSeq;
   cycleState.confirmReqId = reqId;
-  const reqSig = cycleSignature(payload);
-  cycleState.confirmReqSig = reqSig;
+  const reqEpoch = solveInputEpoch;
+  cycleState.confirmReqEpoch = reqEpoch;
+  // 确认是较新请求：此前发出、尚未返回的求解响应一律作废，不得覆盖确认后的结果
+  inflightToken += 1;
 
   const body = {
     ...payload,
@@ -1908,10 +1938,13 @@ async function confirmCyclePlan() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!cycleResponseCurrent("confirm", reqId, reqSig)) return;
+    if (!cycleResponseCurrent("confirm", reqId, reqEpoch)) return;
     const data = await resp.json();
+    // 响应体读取期间输入可能又变：落地前必须再过一次守卫，
+    // 过期确认不得移除关系、覆盖结果或结束较新请求的加载状态
+    if (!cycleResponseCurrent("confirm", reqId, reqEpoch)) return;
     cycleState.confirmReqId = 0;
-    cycleState.confirmReqSig = "";
+    cycleState.confirmReqEpoch = 0;
     elCycleStatus.textContent = "";
     elCycleStatus.className = "status";
     if (!resp.ok) {
@@ -1929,6 +1962,7 @@ async function confirmCyclePlan() {
     state.relations = state.relations.filter(
       (r) => !removeSet.has(`${String(r.lower).trim()} ${String(r.upper).trim()}`)
     );
+    noteSolveInputChanged(); // 关系已移除：此前发出的求解等在途请求一律作废
     render();
     markInferStaleness();
     markSuggestStaleness();
@@ -1939,9 +1973,9 @@ async function confirmCyclePlan() {
     lastSolveResult = data;
     renderResult(data);
   } catch (err) {
-    if (!cycleResponseCurrent("confirm", reqId, reqSig)) return;
+    if (!cycleResponseCurrent("confirm", reqId, reqEpoch)) return;
     cycleState.confirmReqId = 0;
-    cycleState.confirmReqSig = "";
+    cycleState.confirmReqEpoch = 0;
     elCycleStatus.textContent = "";
     elCycleStatus.className = "status";
     showCycleErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
